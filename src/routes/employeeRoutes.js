@@ -105,5 +105,173 @@ router.get('/leaves', protect, async (req, res) => {
   }
 });
 
+// Change Password
+router.put('/change-password', protect, async (req, res) => {
+  const userId = req.user.id; // from protect middleware
+  const { currentPassword, newPassword } = req.body;
+
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ message: 'Current password and new password are required' });
+  }
+
+  try {
+    // Fetch user's current hashed password from database
+    const userQuery = await pool.query(
+      `SELECT password FROM users WHERE id = $1`,
+      [userId]
+    );
+    if (userQuery.rows.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const hashedPassword = userQuery.rows[0].password;
+
+    // Compare provided current password with stored hash
+    const isMatch = await bcrypt.compare(currentPassword, hashedPassword);
+    if (!isMatch) {
+      return res.status(401).json({ message: 'Current password is incorrect' });
+    }
+
+    // Hash the new password
+    const saltRounds = 10;
+    const newHashedPassword = await bcrypt.hash(newPassword, saltRounds);
+
+    // Update password in database
+    await pool.query(
+      `UPDATE users SET password = $1 WHERE id = $2`,
+      [newHashedPassword, userId]
+    );
+
+    res.json({ message: 'Password changed successfully' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ---------- SITE VISIT ROUTES (with customer_phone, using 'users' table) ----------
+
+// Schedule a new site visit
+router.post('/site-visit/schedule', protect, async (req, res) => {
+  const { visit_date, scheduled_time, customer_name, customer_phone, pickup_point, persons, location, description } = req.body;
+  const userId = req.user.id;
+
+  if (!visit_date || !scheduled_time || !customer_name || !pickup_point || !location) {
+    return res.status(400).json({ message: 'Missing required fields: visit_date, scheduled_time, customer_name, pickup_point, location' });
+  }
+
+  try {
+    await pool.query(
+      `INSERT INTO site_visits 
+        (user_id, visit_date, scheduled_time, customer_name, customer_phone, pickup_point, persons, location, description)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [userId, visit_date, scheduled_time, customer_name, customer_phone || null, pickup_point, persons || 1, location, description || null]
+    );
+    res.status(201).json({ message: 'Site visit scheduled successfully' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get count of today's scheduled visits (for the badge)
+router.get('/site-visit/today/count', protect, async (req, res) => {
+  const userId = req.user.id;
+  const today = new Date().toISOString().split('T')[0];
+  try {
+    const result = await pool.query(
+      `SELECT COUNT(*) as count FROM site_visits
+       WHERE visit_date = $1 AND status = 'Scheduled'`,
+      [today]
+    );
+    res.json({ count: parseInt(result.rows[0].count) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get list of today's scheduled visits (includes user name from 'users' table)
+router.get('/site-visit/today', protect, async (req, res) => {
+  const userId = req.user.id;
+  const today = new Date().toISOString().split('T')[0];
+  try {
+    const result = await pool.query(
+      `SELECT sv.id, sv.visit_date, sv.scheduled_time, sv.customer_name, sv.customer_phone, 
+              sv.pickup_point, sv.persons, sv.location, sv.description, sv.status,
+              u.full_name as employee_name
+       FROM site_visits sv
+       JOIN users u ON sv.user_id = u.id
+       WHERE sv.visit_date = $1
+       ORDER BY sv.scheduled_time ASC`,
+      [today]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Get upcoming visits (date > today, status = 'Scheduled')
+router.get('/site-visit/upcoming', protect, async (req, res) => {
+  const userId = req.user.id;
+  const today = new Date().toISOString().split('T')[0];
+  try {
+    const result = await pool.query(
+      `SELECT id, visit_date, scheduled_time, customer_name, customer_phone, 
+              pickup_point, persons, location, description, status
+       FROM site_visits
+       WHERE user_id = $1 AND visit_date > $2 AND status = 'Scheduled'
+       ORDER BY visit_date ASC, scheduled_time ASC`,
+      [userId, today]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Update status of a visit (Complete / Cancel)
+router.put('/site-visit/:id/status', protect, async (req, res) => {
+  const { id } = req.params;
+  const { status } = req.body;
+  if (!['Completed', 'Cancelled'].includes(status)) {
+    return res.status(400).json({ message: 'Invalid status' });
+  }
+  try {
+    const result = await pool.query(
+      `UPDATE site_visits SET status = $1, updated_at = NOW() WHERE id = $2 AND user_id = $3 RETURNING id`,
+      [status, id, req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Visit not found' });
+    }
+    res.json({ message: 'Status updated successfully' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Delete a site visit (only if it belongs to the user)
+router.delete('/site-visit/:id', protect, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      `DELETE FROM site_visits WHERE id = $1 AND user_id = $2 RETURNING id`,
+      [id, req.user.id]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ message: 'Visit not found' });
+    }
+    res.json({ message: 'Visit deleted successfully' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
 
 module.exports = router;

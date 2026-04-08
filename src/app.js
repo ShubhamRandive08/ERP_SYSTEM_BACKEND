@@ -1,6 +1,11 @@
 const express = require("express");
 const app = express();
 
+const cron = require('node-cron');
+const { markAbsent } = require('./controllers/attendanceController');
+
+
+
 app.use(express.json());
 
 app.use((req, res, next) => {
@@ -15,8 +20,22 @@ app.use("/api/employee", require("./routes/employeeRoutes"));
 app.use('/api/admin/users', require('./routes/userRoutes'));
 app.use('/api/admin/attendance',  require('./routes/attendanceRoutes'));
 app.use('/api/admin/leaves',  require('./routes/leaveRoutes'));
-app.use('/api/admin/reports', reportRoutes = require('./routes/reportRoutes'));
+app.use('/api/admin/reports', require('./routes/reportRoutes'));
 app.use('/api/admin/settings', require('./routes/settingsRoutes'));
+app.use('/api/admin/site-visit', require('./routes/adminRoutes'));
+
+
+// Schedule to run at 11:59 PM every day
+cron.schedule('59 23 * * *', async () => {
+  console.log('Running markAbsent cron job at 11:59 PM...');
+  try {
+    await markAbsent();
+    console.log('markAbsent completed successfully');
+  } catch (err) {
+    console.error('markAbsent cron job failed:', err);
+  }
+});
+
 // Serve uploaded files statically
 app.use('/uploads', express.static('uploads'));
 // Example Protected API

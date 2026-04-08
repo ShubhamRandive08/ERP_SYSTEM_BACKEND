@@ -19,134 +19,130 @@ exports.getAttendance = async (req, res) => {
   res.json(result.rows);
 };
 
+const formatToDbDate = (dateInput) => {
+  const date = new Date(dateInput);
+  const day = date.getDate();
+  const month = date.toLocaleString('default', { month: 'long' });
+  const year = date.getFullYear();
+  return `${day} ${month} ${year}`;
+};
+
+// Helper: Calculate working hours between two timestamps
+const calculateWorkingHours = (punchIn, punchOut) => {
+  const diffMs = new Date(punchOut) - new Date(punchIn);
+  const hours = diffMs / (1000 * 60 * 60);
+  const hrs = Math.floor(hours);
+  const mins = Math.round((hours - hrs) * 60);
+  return `${hrs}:${mins.toString().padStart(2, '0')}`;
+};
+
+
+
 // PUNCH IN
 // punch-in
 // PUNCH IN
+// Inside attendanceController.js
 exports.punchIn = async (req, res) => {
+  const userId = req.user.id;
+  const now = new Date();
+  const dateStr = formatToDbDate(now); // "DD Month YYYY"
+  const punchInTime = now;
+
+  // Optional: determine if late (e.g., after 10:00 AM)
+  const hour = now.getHours();
+  const minute = now.getMinutes();
+  let status = 'Present';
+  if (hour > 10 || (hour === 10 && minute > 0)) {
+    status = 'Late';
+  }
+
   try {
-    const userId = req.user.id;
-
-    // Get current time in IST (UTC+5:30)
-    const now = new Date();
-    const istOffsetMs = 5.5 * 60 * 60 * 1000; // IST = UTC + 5:30
-    const istTime = new Date(now.getTime() + istOffsetMs);
-
-    // Format today's date as "DD Month YYYY" (e.g., "04 April 2026")
-    const formattedDate = istTime.toLocaleDateString('en-IN', {
-      day: '2-digit',
-      month: 'long',
-      year: 'numeric',
-      timeZone: 'Asia/Kolkata'  // Ensures IST even if server timezone differs
-    });
-
-    // Check if already punched in today (using the formatted date string)
+    // Check if already punched in today
     const existing = await pool.query(
-      "SELECT * FROM attendance WHERE user_id=$1 AND date=$2",
-      [userId, formattedDate]
+      `SELECT id FROM attendance WHERE user_id = $1 AND date = $2`,
+      [userId, dateStr]
     );
-
     if (existing.rows.length > 0) {
-      return res.status(400).json({ message: "Already punched in" });
+      return res.status(400).json({ message: 'Already punched in today' });
     }
 
-    // Insert with date as formatted string (column should be VARCHAR/TEXT)
-    // Punch-in time is stored as a regular timestamp (could also convert to IST string if needed)
     await pool.query(
-      "INSERT INTO attendance (user_id, date, punch_in, status) VALUES ($1, $2, $3, $4)",
-      [userId, formattedDate, now, "Working"]
+      `INSERT INTO attendance (user_id, date, punch_in, status)
+       VALUES ($1, $2, $3, $4)`,
+      [userId, dateStr, punchInTime, status]
     );
-
-    res.json({ message: "Punch-in success", date: formattedDate });
+    res.json({ message: 'Punched in successfully', status });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: "Error during punch-in" });
+    res.status(500).json({ message: 'Server error' });
   }
 };
 
 // PUNCH OUT
 exports.punchOut = async (req, res) => {
+  const userId = req.user.id;
+  const now = new Date();
+  const dateStr = formatToDbDate(now);
+
   try {
-    const userId = req.user.id;
-    const now = new Date();
-
-    // Night shift handling
-    let attendanceDate = new Date(now);
-    if (now.getHours() < 5) {
-      attendanceDate.setDate(attendanceDate.getDate() - 1);
-    }
-
-    const date = attendanceDate.toLocaleDateString("en-CA");
-
-    // ✅ FIX: match using DATE(punch_in)
     const result = await pool.query(
-      `SELECT * FROM attendance 
-       WHERE user_id=$1 AND DATE(punch_in)=$2`,
-      [userId, date]
+      `SELECT id, punch_in FROM attendance
+       WHERE user_id = $1 AND date = $2 AND punch_out IS NULL`,
+      [userId, dateStr]
     );
-
     if (result.rows.length === 0) {
-      return res.status(400).json({ message: "Punch-in required" });
+      return res.status(400).json({ message: 'No active punch-in found' });
     }
 
-    const record = result.rows[0];
+    const punchInTime = result.rows[0].punch_in;
+    const punchOutTime = now;
+    const diffMs = punchOutTime - new Date(punchInTime);
+    const totalHours = (diffMs / (1000 * 60 * 60)).toFixed(2);
+    const formattedHours = `${Math.floor(totalHours)}:${Math.round((totalHours % 1) * 60)}`;
 
-    if (!record.punch_in) {
-      return res.status(400).json({ message: "Invalid punch-in data" });
-    }
-
-    if (record.punch_out) {
-      return res.status(400).json({ message: "Already punched out" });
-    }
-
-    const punchIn = new Date(record.punch_in);
-    const punchOut = now;
-
-    let total = "00:00";
-    let status = "Absent";
-
-    const diff = punchOut - punchIn;
-
-    if (!isNaN(diff) && diff > 0) {
-      const hours = Math.floor(diff / 3600000);
-      const minutes = Math.floor((diff % 3600000) / 60000);
-
-      total = `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
-
-      if (hours >= 8 && hours >= 7) status = "Present";
-      else if (hours >= 0 && hours < 7) status = "Half Present";
-      else status = "Absent";
-    }
+    // Optionally update status (e.g., if punch-out before expected time)
+    let status = 'Present';
+    // ... custom logic
 
     await pool.query(
-      `UPDATE attendance 
-       SET punch_out=$1, total_hours=$2, status=$3 
-       WHERE id=$4`,   // ✅ BEST: use primary key
-      [punchOut, total, status, record.id]
+      `UPDATE attendance
+       SET punch_out = $1, total_hours = $2, status = $3
+       WHERE id = $4`,
+      [punchOutTime, formattedHours, status, result.rows[0].id]
     );
-
-    res.json({ total, status });
-
+    res.json({ message: 'Punched out successfully', total_hours: formattedHours });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ message: "Server Error" });
+    res.status(500).json({ message: 'Server error' });
   }
 };
 
-// run every day at 12:01 AM
+// Run every day at 12:01 AM to mark absent for users who didn't punch in
 exports.markAbsent = async () => {
-  const today = new Date().toISOString().split("T")[0];
+  const today = new Date();
+  // Format today's date as "DD Month YYYY"
+  const formattedToday = formatToDbDate(today);
+  
+  // For debugging, you can also log the date
+  console.log(`Marking absent for date: ${formattedToday}`);
 
-  await pool.query(
-    `
+  const query = `
     INSERT INTO attendance (user_id, date, status)
     SELECT id, $1, 'Absent'
     FROM users
     WHERE id NOT IN (
-      SELECT user_id FROM attendance WHERE date=$1
+      SELECT user_id FROM attendance WHERE date = $1
     )
-  `,
-    [today],
-  );
+  `;
+  
+  try {
+    const result = await pool.query(query, [formattedToday]);
+    console.log(`Marked ${result.rowCount} users as absent for ${formattedToday}`);
+    return result;
+  } catch (err) {
+    console.error('Error in markAbsent:', err);
+    throw err;
+  }
 };
 
 // @desc    Get daily attendance report (admin only)
